@@ -31,16 +31,18 @@ class Explorer
   end
 
   def explore
+    time_start = Time.now
     while !@queued.empty?
       entry = @queued.pop
-      puts "Executing #{entry[:class]} #{entry[:obj].try(:id)}"
+      # puts "Executing #{entry[:class]} #{entry[:obj].try(:id)}"
       execute(klass: entry[:class], obj: entry[:obj])
     end
 
     derive_insert_order
 
-    puts "Finished with Success!"
-    puts "Visited #{visited.size} objects"
+    time_end = Time.now
+    puts "Finished in #{(time_end - time_start).seconds} seconds"
+    puts "Visited #{@visited.size} objects"
   end
 
   # ActiveRecord::Reflection::HasOneReflection
@@ -49,11 +51,12 @@ class Explorer
   # ActiveRecord::Reflection::ThroughReflection
   # ActiveRecord::Reflection::HasAndBelongsToManyReflection
   def execute(klass:, obj:)
-    puts "Size of queue: #{@queued.size}"
-    puts "About to execute klass: #{klass}"
-    puts "About to execute obj: #{obj.id}"
+    # puts "Size of queue: #{@queued.size}"
+    # puts "Visited so far: #{@visited.size}"
+    # puts "About to execute klass: #{klass}"
+    # puts "About to execute obj: #{obj.id}"
     if visited?(obj)
-      puts "#{klass} #{obj.id} already visited."
+      # puts "#{klass} #{obj.id} already visited."
       return
     end
     mark_as_visited(obj)
@@ -70,27 +73,39 @@ class Explorer
       # if assoc.instance_of?(ActiveRecord::Reflection::HasAndBelongsToManyReflection)
       #   chain << JoinReflection.new()
       # end
+      puts "Chain size: #{chain.size} klass: #{klass} obj: #{obj.id} name: #{assoc.name} " if chain.size > 2
       chain.each do |chain_assoc|
         # ActiveRecord has trouble find the class of polymorphic associations
         chain_klass = assoc_class(chain_assoc, obj)
+        # Mark the class as possibly not to be visited again
+        add_to_blacklist(calling_class: klass, class_to_blacklist: chain_klass, assoc: chain_assoc)
+        if @blacklisted.include?(chain_klass)
+          # puts "Skipping #{chain_klass} because blacklisted.  klass: #{klass}, obj: #{obj.id}"
+          next
+        end
+
+        # It's possible for a chain association to not be an actual association
+        # TODO: research this more
+        next unless obj.respond_to?(chain_assoc.name)
 
         # Call the association on the object
         new_objects = [obj.send(chain_assoc.name)].flatten
 
         # TODO: extract this
-        if dependent_class(chain_assoc) && new_objects.any? && !@dependencies[klass.to_s].include?(chain_klass.to_s)
+        if belongs_to_assoc?(chain_assoc) && new_objects.any? && !@dependencies[klass.to_s].include?(chain_klass.to_s)
           @dependencies[klass.to_s] << chain_klass.to_s
         end
 
         new_objects.each do |new_obj|
           # TODO: should this check for chain_assoc.foreign_key?
-          @queued << { class: chain_klass, obj: new_obj }
+          @queued << { class: chain_klass, obj: new_obj } unless new_obj.nil?
         end
       end
     end
   rescue => e
     puts e.message
     puts e.backtrace
+    raise e
   end
 
   def derive_insert_order
@@ -104,12 +119,21 @@ class Explorer
 
     if deps.size > 0
       puts "Some dependencies could not be inserted:"
-      deps.each { |k, v| puts "Key: #{k}, Val: #{v.join(",")}"}
-      puts "Visited #{visited.size} objects"
-      raise "Some dependencies could not be inserted:"
+      # deps.each { |k, v| puts "Key: #{k}, Val: #{v.join(",")}"}
+      # puts "Visited #{visited.size} objects"
+      # raise "Some dependencies could not be inserted"
     end
 
     @insert_order
+  end
+
+  # The blacklist is initialized with base_class_name.
+  # Keep track of not to visit a classes associations- if the association's class has been blacklisted.
+  # Blacklist the class when an already blacklisted class calls out to it as a belongs_to
+  def add_to_blacklist(calling_class:, class_to_blacklist:, assoc:)
+    if belongs_to_assoc?(assoc) && @blacklisted.include?(calling_class)
+      @blacklisted << class_to_blacklist unless @blacklisted.include?(class_to_blacklist)
+    end
   end
 
   def assoc_class(assoc, obj)
@@ -124,7 +148,7 @@ class Explorer
     ActiveRecord::Base.connection.data_source_exists?(table_name)
   end
 
-  def dependent_class(assoc)
+  def belongs_to_assoc?(assoc)
     assoc.instance_of?(ActiveRecord::Reflection::BelongsToReflection)
   end
 
